@@ -403,7 +403,26 @@ class DummyReport:
 
 def get_report():
     # just for convenience, only rank 0 logs to report
-    from nanochat.common import get_base_dir, get_dist_info
+    try:
+        from nanochat.common import get_base_dir, get_dist_info
+    except ImportError:
+        import os
+
+        def get_base_dir():
+            # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
+            if os.environ.get("NANOCHAT_BASE_DIR"):
+                nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
+            else:
+                home_dir = os.path.expanduser("~")
+                cache_dir = os.path.join(home_dir, ".cache")
+                nanochat_dir = os.path.join(cache_dir, "nanochat")
+            os.makedirs(nanochat_dir, exist_ok=True)
+            return nanochat_dir
+
+        def get_dist_info():
+            if all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+                return True, int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
+            return False, 0, 0, 1
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp_rank == 0:
         report_dir = os.path.join(get_base_dir(), "report")

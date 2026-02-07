@@ -28,8 +28,73 @@ python -m tasks.spellingbee
 
 import re
 import random
-from tasks.common import Task
-from nanochat.common import download_file_with_lock
+import os
+import shutil
+import ssl
+import subprocess
+import urllib.request
+from contextlib import nullcontext
+from .common import Task
+try:
+    from nanochat.common import download_file_with_lock
+except ImportError:
+    def _get_base_dir():
+        if os.environ.get("NANOCHAT_BASE_DIR"):
+            base_dir = os.environ.get("NANOCHAT_BASE_DIR")
+        else:
+            base_dir = os.path.join(os.path.expanduser("~"), ".cache", "nanochat")
+        os.makedirs(base_dir, exist_ok=True)
+        return base_dir
+
+    def download_file_with_lock(url, filename, postprocess_fn=None):
+        """
+        Minimal back-compat implementation of `nanochat.common.download_file_with_lock`.
+        Downloads into `~/.cache/nanochat` (or `NANOCHAT_BASE_DIR`) and uses a file lock when available.
+        """
+        base_dir = _get_base_dir()
+        file_path = os.path.join(base_dir, filename)
+        lock_path = file_path + ".lock"
+
+        if os.path.exists(file_path):
+            return file_path
+
+        try:
+            from filelock import FileLock
+        except Exception:
+            FileLock = None
+
+        lock_ctx = FileLock(lock_path) if FileLock is not None else nullcontext()
+        with lock_ctx:
+            if os.path.exists(file_path):
+                return file_path
+
+            ssl_context = None
+            try:
+                import certifi
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                ssl_context = None
+
+            try:
+                with urllib.request.urlopen(url, context=ssl_context) as response, open(file_path, "wb") as f:
+                    shutil.copyfileobj(response, f)
+            except Exception:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                if shutil.which("curl"):
+                    subprocess.run(
+                        ["curl", "-L", "--fail", "--retry", "3", "-o", file_path, url],
+                        check=True,
+                    )
+                else:
+                    raise
+
+            if postprocess_fn is not None:
+                postprocess_fn(file_path)
+            return file_path
 
 # Letters of the alphabet
 LETTERS = "abcdefghijklmnopqrstuvwxyz"

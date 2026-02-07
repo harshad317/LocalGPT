@@ -23,8 +23,17 @@ Fallback to (1) if you have very limited data AND long documents.
 
 import torch
 import pyarrow.parquet as pq
+import warnings
 
-from nanochat.common import get_dist_info
+try:
+    from nanochat.common import get_dist_info
+except ImportError:
+    import os
+
+    def get_dist_info():
+        if all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+            return True, int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
+        return False, 0, 0, 1
 from nanochat.dataset import list_parquet_files
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
@@ -37,9 +46,8 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    parquet_paths = list_parquet_files()
+    parquet_paths = list_parquet_files(split=split)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
@@ -52,7 +60,18 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         pq_idx = resume_pq_idx if first_pass else 0
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
-            pf = pq.ParquetFile(filepath)
+            try:
+                pf = pq.ParquetFile(filepath)
+            except Exception as exc:
+                warnings.warn(
+                    f"Skipping invalid parquet file: {filepath} ({exc}); "
+                    "delete and re-download to restore full data.",
+                    RuntimeWarning,
+                )
+                parquet_paths.pop(pq_idx)
+                if not parquet_paths:
+                    raise RuntimeError("No valid parquet files remain.") from exc
+                continue
             # Start from resume point if resuming on same file, otherwise from DDP rank
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
                 base_idx = resume_rg_idx // ddp_world_size

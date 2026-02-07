@@ -17,8 +17,6 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
 from contextlib import nullcontext
 
 # -----------------------------------------------------------------------------
@@ -194,8 +192,16 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        try:
+            logits = self.model.forward(
+                ids,
+                kv_cache=kv_cache_prefill,
+                logits_positions=ids.size(1) - 1,
+            )  # (1, vocab_size)
+        except TypeError:
+            # Backward compatibility for simple mock models and older checkpoints.
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)[:, -1, :]  # (1, vocab_size)
+        logits = logits.expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
@@ -263,7 +269,10 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            try:
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode, logits_positions=0)  # (B, vocab_size)
+            except TypeError:
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
@@ -296,6 +305,8 @@ if __name__ == "__main__":
     is equivalent to the faster Engine.generate function here.
     """
     import time
+    from nanochat.common import compute_init, autodetect_device_type
+    from nanochat.checkpoint_manager import load_model
     # init compute
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
     device_type = autodetect_device_type()

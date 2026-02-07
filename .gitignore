@@ -12,3 +12,6 @@ eval_bundle/
 .claude
 CLAUDE.md
 wandb/
+
+# Office temp files
+~$*.xlsx

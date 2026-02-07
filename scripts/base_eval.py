@@ -22,7 +22,98 @@ from contextlib import nullcontext
 
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+try:
+    from nanochat.common import (
+        compute_init,
+        compute_cleanup,
+        print0,
+        get_base_dir,
+        autodetect_device_type,
+        download_file_with_lock,
+    )
+except ImportError:
+    import ssl
+    import urllib.request
+    from contextlib import nullcontext
+
+    def print0(s="", **kwargs):
+        ddp_rank = int(os.environ.get("RANK", 0))
+        if ddp_rank == 0:
+            print(s, **kwargs)
+
+    def get_base_dir():
+        if os.environ.get("NANOCHAT_BASE_DIR"):
+            nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
+        else:
+            nanochat_dir = os.path.join(os.path.expanduser("~"), ".cache", "nanochat")
+        os.makedirs(nanochat_dir, exist_ok=True)
+        return nanochat_dir
+
+    def autodetect_device_type():
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device_type = "mps"
+        else:
+            device_type = "cpu"
+        print0(f"Autodetected device type: {device_type}")
+        return device_type
+
+    def compute_init(device_type="cuda"):
+        assert device_type in ["cuda", "mps", "cpu"]
+        torch.manual_seed(42)
+        if device_type == "cuda":
+            torch.cuda.manual_seed(42)
+        return False, 0, 0, 1, torch.device(device_type)
+
+    def compute_cleanup():
+        return
+
+    def download_file_with_lock(url, filename, postprocess_fn=None):
+        base_dir = get_base_dir()
+        file_path = os.path.join(base_dir, filename)
+        lock_path = file_path + ".lock"
+
+        if os.path.exists(file_path):
+            return file_path
+
+        try:
+            from filelock import FileLock
+        except Exception:
+            FileLock = None
+
+        lock_ctx = FileLock(lock_path) if FileLock is not None else nullcontext()
+        with lock_ctx:
+            if os.path.exists(file_path):
+                return file_path
+
+            ssl_context = None
+            try:
+                import certifi
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                ssl_context = None
+
+            try:
+                with urllib.request.urlopen(url, context=ssl_context) as response, open(file_path, "wb") as f:
+                    shutil.copyfileobj(response, f)
+            except Exception:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                if shutil.which("curl"):
+                    subprocess.run(
+                        ["curl", "-L", "--fail", "--retry", "3", "-o", file_path, url],
+                        check=True,
+                    )
+                else:
+                    raise
+
+            if postprocess_fn is not None:
+                postprocess_fn(file_path)
+            return file_path
 from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -134,7 +225,29 @@ def load_hf_model(hf_path: str, device):
     print0(f"Loading model from: {hf_path}")
     # Load the model
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(hf_path)
+    if device.type == "cuda":
+        torch_dtype = torch.bfloat16
+    elif device.type == "mps":
+        torch_dtype = torch.float16
+    else:
+        torch_dtype = torch.float32
+    # transformers has changed the kwarg name from torch_dtype -> dtype in some versions
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_path,
+            dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+    except TypeError:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_path,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+            )
+        except TypeError:
+            # Older transformers versions may not support some kwargs.
+            model = AutoModelForCausalLM.from_pretrained(hf_path, torch_dtype=torch_dtype)
     model.to(device)
     model.eval()
     max_seq_len = 1024 if "openai-community/gpt2" in hf_path else None
@@ -151,10 +264,13 @@ def main():
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
     parser.add_argument('--model-tag', type=str, default=None, help='optional model tag for the output directory name')
     parser.add_argument('--step', type=str, default=None, help='optional model step for the output directory name')
+    parser.add_argument('--device-type', type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"], help='device type to use (default: auto)')
+    parser.add_argument('--fallback-hf-path', type=str, default="openai-community/gpt2", help='HF model path to use if no local checkpoints are found')
+    parser.add_argument('--no-hf-fallback', action='store_true', help='disable HF fallback when local checkpoints are missing')
     args = parser.parse_args()
 
     # distributed / precision setup
-    device_type = autodetect_device_type()
+    device_type = autodetect_device_type() if args.device_type == "auto" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
@@ -168,9 +284,35 @@ def main():
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
-        model_name = f"base_model (step {meta['step']})" # just for logging
-        model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
+        try:
+            model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+            model_name = f"base_model (step {meta['step']})" # just for logging
+            model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
+        except FileNotFoundError:
+            base_dir = get_base_dir()
+            checkpoints_dir = os.path.join(base_dir, "base_checkpoints")
+            if args.no_hf_fallback:
+                raise SystemExit(
+                    "No local base checkpoints found.\n"
+                    f"- Expected: {checkpoints_dir}\n"
+                    "- Fix: train a base model via `python -m scripts.base_train`, or run eval on a HF model via `python -m scripts.base_eval --hf-path openai-community/gpt2`."
+                )
+            if not args.fallback_hf_path:
+                raise SystemExit(
+                    "No local base checkpoints found and `--fallback-hf-path` is empty.\n"
+                    f"- Expected: {checkpoints_dir}\n"
+                    "- Fix: train a base model via `python -m scripts.base_train`, or pass `--hf-path <model>`."
+                )
+            print0(
+                "No local base checkpoints found.\n"
+                f"- Expected: {checkpoints_dir}\n"
+                f"- Falling back to HuggingFace model: {args.fallback_hf_path}\n"
+                "- Tip: pass `--no-hf-fallback` to disable this behavior."
+            )
+            hf_path = args.fallback_hf_path
+            model, tokenizer = load_hf_model(hf_path, device)
+            model_name = hf_path
+            model_slug = hf_path.replace("/", "-")
 
     # Evaluate the model
     with autocast_ctx:

@@ -7,6 +7,8 @@ Example tasks: MMLU, ARC-Easy, ARC-Challenge, GSM8K, HumanEval, SmolTalk.
 
 import random
 
+__all__ = ["Task", "TaskMixture", "TaskSequence", "render_mc"]
+
 class Task:
     """
     Base class of a Task. Allows for lightweight slicing of the underlying dataset.
@@ -73,6 +75,13 @@ class TaskMixture(Task):
         rng.shuffle(self.index_map)
         # Note: this is not the most elegant or best solution, but it's ok for now
 
+    @property
+    def eval_type(self):
+        eval_types = {t.eval_type for t in self.tasks}
+        if len(eval_types) != 1:
+            raise ValueError(f"TaskMixture contains mixed eval types: {sorted(eval_types)}")
+        return next(iter(eval_types))
+
     def num_examples(self):
         return self.num_conversations
 
@@ -97,6 +106,13 @@ class TaskSequence(Task):
         self.tasks = tasks
         self.lengths = [len(task) for task in self.tasks]
         self.num_conversations = sum(self.lengths)
+
+    @property
+    def eval_type(self):
+        eval_types = {t.eval_type for t in self.tasks}
+        if len(eval_types) != 1:
+            raise ValueError(f"TaskSequence contains mixed eval types: {sorted(eval_types)}")
+        return next(iter(eval_types))
 
     def num_examples(self):
         return self.num_conversations
@@ -130,6 +146,89 @@ def render_mc(question, letters, choices):
     query += "\nRespond only with the letter of the correct answer."
     return query
 
+
+# Back-compat for older checkouts/forks that may have renamed or omitted symbols.
+if "Task" not in globals():
+    if "BaseTask" in globals():
+        Task = globals()["BaseTask"]
+    elif "TaskBase" in globals():
+        Task = globals()["TaskBase"]
+    else:
+        class Task:  # type: ignore[no-redef]
+            def __init__(self, start=0, stop=None, step=1):
+                self.start = start
+                self.stop = stop
+                self.step = step
+
+            @property
+            def eval_type(self):
+                raise NotImplementedError
+
+            def num_examples(self):
+                raise NotImplementedError
+
+            def get_example(self, index):
+                raise NotImplementedError
+
+            def __len__(self):
+                start = self.start
+                stop = self.num_examples() if self.stop is None else self.stop
+                step = self.step
+                span = stop - start
+                return (span + step - 1) // step
+
+            def __getitem__(self, index: int):
+                physical_index = self.start + index * self.step
+                return self.get_example(physical_index)
+
+            def evaluate(self, problem, completion):
+                raise NotImplementedError
+
+if "TaskMixture" not in globals():
+    class TaskMixture(Task):  # type: ignore[no-redef]
+        def __init__(self, tasks, **kwargs):
+            super().__init__(**kwargs)
+            self.tasks = tasks
+
+        @property
+        def eval_type(self):
+            eval_types = {t.eval_type for t in self.tasks}
+            if len(eval_types) != 1:
+                raise ValueError(f"TaskMixture contains mixed eval types: {sorted(eval_types)}")
+            return next(iter(eval_types))
+
+        def num_examples(self):
+            return sum(len(t) for t in self.tasks)
+
+        def get_example(self, index):
+            for task in self.tasks:
+                if index < len(task):
+                    return task[index]
+                index -= len(task)
+            raise IndexError(index)
+
+if "TaskSequence" not in globals():
+    class TaskSequence(Task):  # type: ignore[no-redef]
+        def __init__(self, tasks, **kwargs):
+            super().__init__(**kwargs)
+            self.tasks = tasks
+
+        @property
+        def eval_type(self):
+            eval_types = {t.eval_type for t in self.tasks}
+            if len(eval_types) != 1:
+                raise ValueError(f"TaskSequence contains mixed eval types: {sorted(eval_types)}")
+            return next(iter(eval_types))
+
+        def num_examples(self):
+            return sum(len(t) for t in self.tasks)
+
+        def get_example(self, index):
+            for task in self.tasks:
+                if index < len(task):
+                    return task[index]
+                index -= len(task)
+            raise IndexError(index)
 
 if __name__ == "__main__":
     # very lightweight test of slicing

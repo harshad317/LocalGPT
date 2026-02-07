@@ -18,18 +18,170 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    import torch._dynamo as dynamo
+except Exception:
+    dynamo = None
 
-from nanochat.common import get_dist_info, print0
+try:
+    from nanochat.common import get_dist_info, print0
+except ImportError:
+    import os
+
+    def print0(s="", **kwargs):
+        ddp_rank = int(os.environ.get("RANK", 0))
+        if ddp_rank == 0:
+            print(s, **kwargs)
+
+    def get_dist_info():
+        if all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+            return True, int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
+        return False, 0, 0, 1
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
-# Load Flash Attention 3 from HuggingFace Hub (and silence the progress bar)
 import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-# Official docs of FA3 label it as "beta" and want you to install FA3 from source, which is a pain.
-# Wishing for official FA3 wheels soon, for now this seems to be a fast way to get them (ty varunneal)
-from kernels import get_kernel
-flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+_MAX_LOGITS_BYTES = int(os.environ.get("NANOCHAT_MAX_LOGITS_BYTES", 1024 * 1024 * 1024))
+
+def _sliding_causal_attn_mask(q_len: int, k_len: int, *, q_pos0: int, window_size, device):
+    """
+    Build an additive attention mask (float) where masked positions are -inf.
+    q_pos0 is the absolute position of query index 0 within the full sequence.
+    """
+    left, right = window_size
+    assert right == 0, "Only causal attention is supported (window_size right must be 0)"
+    q_idx = torch.arange(q_len, device=device).view(q_len, 1)
+    k_idx = torch.arange(k_len, device=device).view(1, k_len)
+    q_abs = q_pos0 + q_idx
+    # causal: keys cannot be in the future relative to each query position
+    allowed = k_idx <= q_abs
+    if left >= 0:
+        # sliding window: allow only the last `left` tokens before current position (plus itself)
+        allowed = allowed & (k_idx >= (q_abs - left))
+    mask = torch.zeros((q_len, k_len), dtype=torch.float32, device=device)
+    mask = mask.masked_fill(~allowed, float("-inf"))
+    return mask
+
+
+class _TorchSDPAFlashAttnFallback:
+    """
+    Minimal Flash Attention 3 interface implemented via PyTorch SDPA.
+    This exists to keep training/inference usable when `kernels`/FA3 isn't available.
+    """
+
+    @staticmethod
+    def _expand_kv_for_gqa(x: torch.Tensor, n_query_heads: int) -> torch.Tensor:
+        # x: (B, T, Hkv, D) -> (B, T, Hq, D)
+        b, t, h_kv, d = x.shape
+        if h_kv == n_query_heads:
+            return x
+        assert n_query_heads % h_kv == 0, "n_heads must be a multiple of n_kv_heads for GQA"
+        repeat = n_query_heads // h_kv
+        return x.repeat_interleave(repeat, dim=2)
+
+    def flash_attn_func(self, q, k, v, *, causal: bool, window_size):
+        assert causal is True, "Only causal attention is supported"
+        b, t, hq, d = q.shape
+        k = self._expand_kv_for_gqa(k, hq)
+        v = self._expand_kv_for_gqa(v, hq)
+        # SDPA uses (B, H, T, D)
+        qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        left, right = window_size
+        if left < 0 or left >= t:
+            y = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
+        else:
+            mask = _sliding_causal_attn_mask(t, t, q_pos0=0, window_size=window_size, device=qh.device)
+            y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask)
+        return y.transpose(1, 2)
+
+    def flash_attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        *,
+        k,
+        v,
+        cache_seqlens,
+        causal: bool,
+        window_size,
+    ):
+        assert causal is True, "Only causal attention is supported"
+        b, t, hq, d = q.shape
+        pos0 = cache_seqlens.to(torch.int64)
+        max_seq = k_cache.size(1)
+        if (pos0 + t).max().item() > max_seq:
+            raise ValueError(f"KV cache overflow: pos+t exceeds max_seq_len ({max_seq})")
+
+        # Write new keys/values into the cache at each batch element's position.
+        # Note: this is intentionally simple and correct; it's not optimized.
+        for bi in range(b):
+            p = int(pos0[bi].item())
+            k_cache[bi, p:p+t, :, :] = k[bi]
+            v_cache[bi, p:p+t, :, :] = v[bi]
+
+        # Attend over the cache up to (pos0 + t) for each batch element.
+        ys = []
+        for bi in range(b):
+            p = int(pos0[bi].item())
+            k_len = p + t
+            k_all = k_cache[bi : bi + 1, :k_len, :, :]
+            v_all = v_cache[bi : bi + 1, :k_len, :, :]
+            k_all = self._expand_kv_for_gqa(k_all, hq)
+            v_all = self._expand_kv_for_gqa(v_all, hq)
+            qh = q[bi : bi + 1].transpose(1, 2)
+            kh = k_all.transpose(1, 2)
+            vh = v_all.transpose(1, 2)
+            left, right = window_size
+            if p == 0 and (left < 0 or left >= t) and k_len == t:
+                y = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
+            else:
+                mask = _sliding_causal_attn_mask(t, k_len, q_pos0=p, window_size=window_size, device=qh.device)
+                y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask)
+            ys.append(y.transpose(1, 2))
+        return torch.cat(ys, dim=0)
+
+
+_FLASH_ATTN = None
+_FLASH_ATTN_FALLBACK_WARNED = False
+
+
+def _get_flash_attn():
+    global _FLASH_ATTN, _FLASH_ATTN_FALLBACK_WARNED
+    if _FLASH_ATTN is not None:
+        return _FLASH_ATTN
+    if os.environ.get("NANOCHAT_DISABLE_FA3", "") == "1":
+        _FLASH_ATTN = _TorchSDPAFlashAttnFallback()
+        return _FLASH_ATTN
+    try:
+        # Load Flash Attention 3 from HuggingFace Hub.
+        # Official docs of FA3 label it as "beta" and want you to install FA3 from source, which is a pain.
+        # Wishing for official FA3 wheels soon, for now this seems to be a fast way to get them (ty varunneal)
+        from kernels import get_kernel  # type: ignore
+
+        _FLASH_ATTN = get_kernel("varunneal/flash-attention-3").flash_attn_interface
+        return _FLASH_ATTN
+    except Exception as e:
+        _FLASH_ATTN = _TorchSDPAFlashAttnFallback()
+        if not _FLASH_ATTN_FALLBACK_WARNED:
+            _FLASH_ATTN_FALLBACK_WARNED = True
+            extra_hint = ""
+            msg = str(e)
+            if "GLIBC_" in msg and "not found" in msg:
+                extra_hint = (
+                    " Detected a GLIBC mismatch while loading the FA3 extension. "
+                    "This usually means the downloaded binary was built against a newer OS (e.g. Ubuntu 22.04, glibc>=2.32) "
+                    "than your runtime (e.g. Ubuntu 20.04, glibc 2.31). "
+                    "Fix: use an Ubuntu 22.04-based container/image, or build/install Flash Attention 3 from source on the machine."
+                )
+            print0(
+                "Flash Attention 3 unavailable; falling back to PyTorch SDPA. "
+                "For best performance, install `kernels` and ensure HF Hub access. "
+                f"(Reason: {type(e).__name__}: {e}){extra_hint} "
+                "To silence this message, set NANOCHAT_DISABLE_FA3=1."
+            )
+        return _FLASH_ATTN
 
 @dataclass
 class GPTConfig:
@@ -90,6 +242,7 @@ class CausalSelfAttention(nn.Module):
         # Attention with Flash Attention 3
         # FA3 handles GQA automatically when n_kv_heads < n_heads
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        flash_attn = _get_flash_attn()
         if kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -310,37 +463,107 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 5 groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas)
-        matrix_params = list(self.transformer.h.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params)
+        matrix_params_all = list(self.transformer.h.parameters())
+        embedding_params_all = list(self.transformer.wte.parameters())
+        lm_head_params_all = list(self.lm_head.parameters())
+        resid_params_all = [self.resid_lambdas]
+        x0_params_all = [self.x0_lambdas]
+        assert len(list(self.parameters())) == len(matrix_params_all) + len(embedding_params_all) + len(lm_head_params_all) + len(resid_params_all) + len(x0_params_all)
+        # Filter to trainable params so freezing is safe (Muon/AdamW expect grads).
+        matrix_params = [p for p in matrix_params_all if p.requires_grad]
+        embedding_params = [p for p in embedding_params_all if p.requires_grad]
+        lm_head_params = [p for p in lm_head_params_all if p.requires_grad]
+        resid_params = [p for p in resid_params_all if p.requires_grad]
+        x0_params = [p for p in x0_params_all if p.requires_grad]
         # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        adam_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
-            dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
-            dict(params=x0_params, lr=scalar_lr),
-        ]
+        adam_groups = []
+        if lm_head_params:
+            adam_groups.append(dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale))
+        if embedding_params:
+            adam_groups.append(dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale))
+        if resid_params:
+            adam_groups.append(dict(params=resid_params, lr=scalar_lr * 0.01)) # sensitive, accumulates in residual stream
+        if x0_params:
+            adam_groups.append(dict(params=x0_params, lr=scalar_lr))
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
-        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs) if adam_groups else None
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
         MuonFactory = DistMuon if ddp else Muon
-        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs) if matrix_params else None
         # Combine them the two optimizers into one list
-        optimizers = [adamw_optimizer, muon_optimizer]
+        optimizers = [opt for opt in (adamw_optimizer, muon_optimizer) if opt is not None]
+        if not optimizers:
+            raise ValueError("No trainable parameters found; all params are frozen.")
         for opt in optimizers:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _loss_from_hidden(self, x, targets, loss_reduction, softcap):
+        if loss_reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"Unsupported loss_reduction: {loss_reduction}")
+        vocab_size = self.config.vocab_size
+        b, t, c = x.size()
+        flat_tokens = b * t
+        targets_flat = targets.view(-1)
+        total_logits_bytes = flat_tokens * vocab_size * 4  # float32 for loss/softcap
+        if total_logits_bytes <= _MAX_LOGITS_BYTES:
+            logits = self.lm_head(x)
+            logits = logits[..., :vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets_flat,
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
+
+        chunk_tokens = max(1, _MAX_LOGITS_BYTES // (vocab_size * 4))
+        x_flat = x.view(flat_tokens, c)
+        if loss_reduction == "none":
+            losses = torch.empty(flat_tokens, dtype=torch.float32, device=x.device)
+            for start in range(0, flat_tokens, chunk_tokens):
+                end = min(start + chunk_tokens, flat_tokens)
+                logits = self.lm_head(x_flat[start:end])
+                logits = logits[..., :vocab_size]
+                logits = logits.float()
+                logits = softcap * torch.tanh(logits / softcap)
+                losses[start:end] = F.cross_entropy(
+                    logits,
+                    targets_flat[start:end],
+                    ignore_index=-1,
+                    reduction="none",
+                )
+            return losses
+
+        loss_sum = torch.zeros((), dtype=torch.float32, device=x.device)
+        valid_tokens = torch.zeros((), dtype=torch.int64, device=x.device)
+        for start in range(0, flat_tokens, chunk_tokens):
+            end = min(start + chunk_tokens, flat_tokens)
+            logits = self.lm_head(x_flat[start:end])
+            logits = logits[..., :vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+            loss_sum = loss_sum + F.cross_entropy(
+                logits,
+                targets_flat[start:end],
+                ignore_index=-1,
+                reduction="sum",
+            )
+            if loss_reduction == "mean":
+                valid_tokens = valid_tokens + (targets_flat[start:end] != -1).sum()
+        if loss_reduction == "sum":
+            return loss_sum
+        denom = valid_tokens.clamp_min(1).to(loss_sum.dtype)
+        return loss_sum / denom
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', logits_positions=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -361,20 +584,40 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Forward the lm_head (compute logits)
+        # NOTE: (B, T, V) is extremely large when vocab_size is big (e.g. 262k).
+        # For inference/evaluation that only needs logits at specific positions, pass logits_positions
+        # to compute a (B, V) tensor instead and save a lot of memory.
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        if targets is not None:
+            if logits_positions is not None:
+                raise ValueError("logits_positions is not supported when targets is provided")
+            loss_fn = self._loss_from_hidden
+            if loss_reduction == "none" and dynamo is not None:
+                loss_fn = dynamo.disable(loss_fn)
+            return loss_fn(x, targets, loss_reduction, softcap)
+        if logits_positions is not None:
+            if isinstance(logits_positions, int):
+                pos = torch.full((B,), logits_positions, dtype=torch.long, device=idx.device)
+            else:
+                pos = logits_positions
+                if not torch.is_tensor(pos):
+                    pos = torch.tensor(pos, dtype=torch.long, device=idx.device)
+                pos = pos.to(device=idx.device, dtype=torch.long)
+                if pos.ndim == 0:
+                    pos = pos.expand(B)
+            assert pos.shape == (B,), f"logits_positions must be shape (B,), got {tuple(pos.shape)}"
+            assert (pos >= 0).all() and (pos < T).all(), "logits_positions out of range"
+            x_sel = x[torch.arange(B, device=idx.device), pos]  # (B, C)
+            logits = self.lm_head(x_sel)  # (B, padded_vocab_size)
+            logits = logits[..., :self.config.vocab_size]  # slice to remove padding
+        else:
+            logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+            logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
+        # inference: just return the logits directly
+        return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
@@ -392,8 +635,7 @@ class GPT(nn.Module):
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
+            logits = self.forward(ids, logits_positions=ids.size(1) - 1) # (B, vocab_size)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')

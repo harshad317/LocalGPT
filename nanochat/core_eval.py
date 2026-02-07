@@ -177,7 +177,10 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     if num_fewshot > 0:
         rng = random.Random(1234 + idx)
         available_indices = [i for i in range(len(data)) if i != idx]
-        fewshot_indices = rng.sample(available_indices, num_fewshot)
+        # When debugging with a cropped dataset (`--max-per-task`), it may be
+        # impossible to draw the requested number of few-shot examples.
+        k = min(num_fewshot, len(available_indices))
+        fewshot_indices = rng.sample(available_indices, k) if k > 0 else []
         fewshot_examples = [data[i] for i in fewshot_indices]
 
     # Render prompts and batch sequences based on task type

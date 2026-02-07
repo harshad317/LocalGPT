@@ -6,9 +6,13 @@ import os
 import re
 import logging
 import urllib.request
+import ssl
+import shutil
+import subprocess
 import torch
 import torch.distributed as dist
 from filelock import FileLock
+
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
@@ -78,14 +82,34 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         if os.path.exists(file_path):
             return file_path
 
-        # Download the content as bytes
+        # Download the content to disk
         print(f"Downloading {url}...")
-        with urllib.request.urlopen(url) as response:
-            content = response.read() # bytes
-
-        # Write to local file
-        with open(file_path, 'wb') as f:
-            f.write(content)
+        ssl_context = None
+        try:
+            import certifi
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ssl_context = None
+        try:
+            with urllib.request.urlopen(url, context=ssl_context) as response, open(file_path, 'wb') as f:
+                shutil.copyfileobj(response, f)
+        except Exception as e:
+            # Some Python distributions (notably on macOS) can have SSL CA issues while
+            # `curl` still works due to the system trust store. Fall back to curl in
+            # this common case.
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            is_cert_error = isinstance(e, urllib.error.URLError) and isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError)
+            if is_cert_error and shutil.which("curl"):
+                subprocess.run(
+                    ["curl", "-L", "--fail", "--retry", "3", "-o", file_path, url],
+                    check=True,
+                )
+            else:
+                raise
         print(f"Downloaded to {file_path}")
 
         # Run the postprocess function if provided
@@ -170,14 +194,52 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     # Precision
     if device_type == "cuda":
-        torch.backends.cuda.matmul.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
+        # Prefer TF32 on Ampere+ for speed; fall back gracefully across torch versions/builds.
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+        try:
+            # Available in newer torch; "high" enables TF32 where applicable.
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if is_ddp_requested and device_type == "cuda":
-        device = torch.device("cuda", ddp_local_rank)
-        torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
+        device_count = torch.cuda.device_count()
+        if device_count <= 0:
+            raise RuntimeError("DDP requested with device_type='cuda' but no visible CUDA devices were found")
+
+        if ddp_local_rank >= device_count:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            oversubscribe = os.environ.get("NANOCHAT_OVERSUBSCRIBE_GPUS", "") == "1"
+            if not oversubscribe:
+                raise RuntimeError(
+                    f"Invalid LOCAL_RANK={ddp_local_rank} for {device_count} visible CUDA device(s). "
+                    "This usually means `--nproc_per_node` is larger than the number of GPUs on the node. "
+                    f"Fix: set `--nproc_per_node={device_count}` (or set `CUDA_VISIBLE_DEVICES` to the GPUs you want). "
+                    f"CUDA_VISIBLE_DEVICES={visible!r}. "
+                    "If you *intentionally* want multiple ranks per GPU, set `NANOCHAT_OVERSUBSCRIBE_GPUS=1` "
+                    "(not recommended unless you know what you're doing)."
+                )
+            mapped = ddp_local_rank % device_count
+            logger.warning(
+                f"LOCAL_RANK={ddp_local_rank} exceeds visible device_count={device_count}; "
+                f"mapping rank to cuda:{mapped} due to NANOCHAT_OVERSUBSCRIBE_GPUS=1"
+            )
+            device_idx = mapped
+        else:
+            device_idx = ddp_local_rank
+
+        device = torch.device("cuda", device_idx)
+        torch.cuda.set_device(device_idx)  # make "cuda" default to this device
+        try:
+            dist.init_process_group(backend="nccl", device_id=device)
+        except TypeError:
+            dist.init_process_group(backend="nccl")
         dist.barrier()
     else:
         device = torch.device(device_type) # mps|cpu

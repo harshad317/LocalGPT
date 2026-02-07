@@ -8,10 +8,28 @@ import json
 import logging
 import torch
 
-from nanochat.common import get_base_dir
+try:
+    from nanochat.common import get_base_dir
+except ImportError:
+    # Back-compat: older `nanochat.common` may not define `get_base_dir`.
+    def get_base_dir():
+        # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
+        if os.environ.get("NANOCHAT_BASE_DIR"):
+            nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
+        else:
+            home_dir = os.path.expanduser("~")
+            cache_dir = os.path.join(home_dir, ".cache")
+            nanochat_dir = os.path.join(cache_dir, "nanochat")
+        os.makedirs(nanochat_dir, exist_ok=True)
+        return nanochat_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
-from nanochat.common import setup_default_logging
+try:
+    from nanochat.common import setup_default_logging
+except ImportError:
+    # Back-compat: keep logging usable if `setup_default_logging` doesn't exist.
+    def setup_default_logging():
+        logging.basicConfig(level=logging.INFO)
 
 # Set up logging
 setup_default_logging()

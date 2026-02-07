@@ -16,10 +16,11 @@ Notice that GSM8K uses tool calls inside << >> tags.
 
 import re
 from datasets import load_dataset
-from tasks.common import Task
+from .common import Task
 
 
 GSM_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+LAST_NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 def extract_answer(completion):
     """
     Extract the numerical answer after #### marker.
@@ -31,6 +32,10 @@ def extract_answer(completion):
         match_str = match.group(1).strip()
         match_str = match_str.replace(",", "")
         return match_str
+    # Fallback: use the last number in the completion (helps when #### is omitted).
+    matches = LAST_NUM_RE.findall(completion)
+    if matches:
+        return matches[-1].replace(",", "")
     return None
 
 
@@ -53,6 +58,7 @@ class GSM8K(Task):
         """ Get a single problem from the dataset. """
         row = self.ds[index]
         question = row['question'] # string of the question prompt
+        question = question.rstrip() + "\n\nProvide the final answer on a separate line in the format: #### <number>."
         answer = row['answer'] # string of the full solution and the answer after #### marker
         # Create and return the Conversation object
         # This is tricky because GSM8K uses tool calls, which we need to parse here.

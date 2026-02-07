@@ -5,7 +5,7 @@ Each line in the JSONL file should be a JSON array of messages.
 
 import os
 import json
-from tasks.common import Task
+from .common import Task
 
 class CustomJSON(Task):
     """
@@ -62,4 +62,3 @@ class CustomJSON(Task):
             "messages": messages,
         }
         return conversation
-
