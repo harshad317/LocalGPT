@@ -423,6 +423,9 @@ if args.early_stop_patience > 0 and (args.eval_every < 0 and not args.eval_every
 if args.early_stop_metric == "bench" and not args.bench_eval:
     print0("Warning: early stopping on benchmarks requested; enabling --bench-eval.")
     args.bench_eval = True
+if args.early_stop_metric == "bench":
+    print0("Warning: early stopping on benchmarks leaks test performance; forcing --early-stop-metric=val_bpb.")
+    args.early_stop_metric = "val_bpb"
 ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
@@ -487,6 +490,12 @@ HENDRYCKS_SUBJECTS = [
     "precalculus",
 ]
 
+# Holdout sizes for dev/val splits drawn from train-only datasets.
+# These are excluded from training to avoid leakage into early stopping.
+SMOLTALK_DEV_SIZE = 24000
+GSM8K_DEV_SIZE = 420
+HENDRYCKS_DEV_SIZE = 100
+
 SDPO_REASONING_DATASETS = [
     "gsm8k-platinum",
     "gsm8k-567",
@@ -534,10 +543,10 @@ def _phase_weight(base_weight, phase2=False):
 
 def build_default_train_tasks():
     return [
-        SmolTalk(split="train"),  # 460K rows of general conversations
+        SmolTalk(split="train", start=SMOLTALK_DEV_SIZE),  # 460K rows of general conversations
         Alpaca(split="train"),  # instruction-following (helps IFEval-style constraints)
         MMLU(subset="auxiliary_train", split="train"),  # 100K rows of multiple choice problems
-        GSM8K(subset="main", split="train"),  # 8K rows teaching simple math and (calculator) tool use
+        GSM8K(subset="main", split="train", start=GSM8K_DEV_SIZE),  # 8K rows teaching simple math and (calculator) tool use
         CustomJSON(filepath=identity_conversations_filepath),  # 1K rows of synthetic identity conversations
         CustomJSON(filepath=identity_conversations_filepath),  # repeat for more weight
         SimpleSpelling(size=200000, split="train"),  # spelling practice
@@ -591,9 +600,9 @@ def build_benchmarks_train_tasks(phase2=False):
         print0(f"[mid_train] Skipping MMLU subject upweighting due to load error: {exc}")
     return [
         # General chat + instruction following
-        SmolTalk(split="train", stop=200000),
+        SmolTalk(split="train", start=SMOLTALK_DEV_SIZE, stop=SMOLTALK_DEV_SIZE + 200000),
         Alpaca(split="train"),
-        # NOTE: IFEval has no reference responses; avoid training on empty assistant outputs.
+        # IFEval stays eval-only (train targets are empty in this codebase).
         # Reasoning / chain-of-thought style data
         OpenThoughts2(split="train", stop=200000),
         SkunkworksReasoning(split="train"),
@@ -602,7 +611,7 @@ def build_benchmarks_train_tasks(phase2=False):
         # Multiple choice + commonsense
         _maybe_repeat(MMLU(subset="auxiliary_train", split="train"), _phase_weight(args.upweight_mmlu, phase2)),
         *extra_mmlu_subject_tasks,
-        _maybe_repeat(MMLUPro(split="validation"), _phase_weight(args.upweight_mmlu_pro, phase2)),  # no train split; use validation for training
+        # NOTE: MMLU-Pro has no train split; keep it eval-only to avoid validation/test leakage.
         _maybe_repeat(ARC(subset="ARC-Challenge", split="train"), _phase_weight(args.upweight_arc, phase2)),
         _maybe_repeat(ARC(subset="ARC-Easy", split="train"), _phase_weight(args.upweight_arc, phase2)),
         _maybe_repeat(HellaSwag(split="train"), _phase_weight(args.upweight_hellaswag, phase2)),
@@ -611,14 +620,14 @@ def build_benchmarks_train_tasks(phase2=False):
         # Hard science QA (very small dataset; oversample by repetition)
         *gpqa_tasks,
         # Math
-        _maybe_repeat(GSM8K(subset="main", split="train"), _phase_weight(args.upweight_gsm8k, phase2)),
+        _maybe_repeat(GSM8K(subset="main", split="train", start=GSM8K_DEV_SIZE), _phase_weight(args.upweight_gsm8k, phase2)),
         OpenMathInstruct2(split="train", stop=200000),
         NuminaMathQwQ(split="train", stop=200000),
         AIME2024(split="train"),
         AIME2025(split="train"),
         *[
             _maybe_repeat(
-                HendrycksMath(subject=s, split="train"),
+                HendrycksMath(subject=s, split="train", start=HENDRYCKS_DEV_SIZE),
                 _phase_weight(args.upweight_hendrycks, phase2),
             )
             for s in HENDRYCKS_SUBJECTS
@@ -643,14 +652,13 @@ def build_benchmarks_train_tasks(phase2=False):
 
 def build_default_val_tasks():
     return [
-        SmolTalk(split="test"),  # 24K rows in test set
-        MMLU(subset="all", split="test", stop=5200),  # 14K rows in test set, use only 5.2K to match the train ratios
-        GSM8K(subset="main", split="test", stop=420),  # 1.32K rows in test set, use only 420 to match the train ratios
+        SmolTalk(split="train", stop=SMOLTALK_DEV_SIZE),  # holdout from train
+        MMLU(subset="all", split="dev"),  # dev split (avoid test leakage)
+        GSM8K(subset="main", split="train", stop=GSM8K_DEV_SIZE),  # holdout from train
     ]
 
 def build_benchmarks_val_tasks():
     # Prefer test splits; fall back to validation when test isn't available.
-    # Train-only datasets are intentionally skipped here.
     return [
         # Multiple choice + commonsense
         ARC(subset="ARC-Challenge", split="test"),
@@ -670,33 +678,65 @@ def build_benchmarks_val_tasks():
     ]
 
 def build_benchmark_eval_tasks():
-    eval_tasks = [
-        ("ARC-Challenge", ARC(subset="ARC-Challenge", split="test")),
-        ("ARC-Easy", ARC(subset="ARC-Easy", split="test")),
-        ("HellaSwag", HellaSwag(split="validation")),
-        ("MMLU", MMLU(subset="all", split="test")),
-        ("MMLU-Pro", MMLUPro(split="test")),
-        ("GSM8K", GSM8K(subset="main", split="test")),
-        ("HendrycksMath", TaskMixture([HendrycksMath(subject=s, split="test") for s in HENDRYCKS_SUBJECTS])),
-        ("AIME-2024", AIME2024(split="train")),
-        ("AIME-2025", AIME2025(split="train")),
-        ("HumanEval", HumanEval()),
-        ("TriviaQA", TriviaQA(subset="unfiltered", split="validation")),
-        ("HLE", HLE(split="test")),
-        ("IFEval", IFEval(split="train")),
-    ]
+    def _try_splits(name, builders):
+        last_exc = None
+        for builder in builders:
+            try:
+                return builder()
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            print0(f"[mid_train] Skipping {name} eval due to load error: {last_exc}")
+        return None
+
+    eval_tasks = []
+
+    # Only include benchmarks with explicit test splits.
+    task = _try_splits(
+        "ARC-Challenge",
+        [lambda: ARC(subset="ARC-Challenge", split="test")],
+    )
+    if task is not None:
+        eval_tasks.append(("ARC-Challenge", task))
+    task = _try_splits(
+        "ARC-Easy",
+        [lambda: ARC(subset="ARC-Easy", split="test")],
+    )
+    if task is not None:
+        eval_tasks.append(("ARC-Easy", task))
+
+    task = _try_splits("MMLU", [lambda: MMLU(subset="all", split="test")])
+    if task is not None:
+        eval_tasks.append(("MMLU", task))
+
+    task = _try_splits("MMLU-Pro", [lambda: MMLUPro(split="test")])
+    if task is not None:
+        eval_tasks.append(("MMLU-Pro", task))
+
+    task = _try_splits("GSM8K", [lambda: GSM8K(subset="main", split="test")])
+    if task is not None:
+        eval_tasks.append(("GSM8K", task))
+
+    task = _try_splits(
+        "HendrycksMath",
+        [lambda: TaskMixture([HendrycksMath(subject=s, split="test") for s in HENDRYCKS_SUBJECTS])],
+    )
+    if task is not None:
+        eval_tasks.append(("HendrycksMath", task))
+
+    task = _try_splits("HumanEval", [lambda: HumanEval()])
+    if task is not None:
+        eval_tasks.append(("HumanEval", task))
+
+    task = _try_splits("HLE", [lambda: HLE(split="test")])
+    if task is not None:
+        eval_tasks.append(("HLE", task))
+
     try:
-        eval_tasks.insert(8, ("XLAM-FC", XLAMFunctionCalling(split="train")))
-    except Exception as exc:
-        print0(f"[mid_train] Skipping XLAM-FC (eval) due to load error: {exc}")
-    try:
-        eval_tasks.insert(9, ("BFCL-v3", build_bfcl_v3_benchmark()))
+        eval_tasks.append(("BFCL-v3", build_bfcl_v3_benchmark()))
     except Exception as exc:
         print0(f"[mid_train] Skipping BFCL-v3 (eval) due to load error: {exc}")
-    try:
-        eval_tasks.insert(5, ("GPQA", GPQA(subset="gpqa_main", split="train")))
-    except Exception as exc:
-        print0(f"[mid_train] Skipping GPQA (eval) due to load error: {exc}")
+
     return eval_tasks
 
 def _resolve_task_for_index(task_object, index):
@@ -883,6 +923,7 @@ last_step = False # we will toggle this to True when we reach the end of the tra
 approx_progress = 0.0 # will go from 0 to 1 over the course of training
 current_epoch = 1 # track epoch for logging
 epochs_completed = 0 # track completed epochs for eval triggers
+current_epoch_sync_for_loader = 1 # synced epoch gate for phase scheduling
 def mid_data_generator_bos_bestfit(split, buffer_size=100):
     """
     BOS-aligned dataloader for midtraining with bestfit-crop packing.
@@ -908,7 +949,7 @@ def mid_data_generator_bos_bestfit(split, buffer_size=100):
     def _select_train_dataset(consumed_count):
         if not use_phase2:
             return train_dataset, 1
-        epoch = min(args.num_epochs, consumed_count // train_epoch_size + 1)
+        epoch = current_epoch_sync_for_loader
         if epoch >= args.phase2_start_epoch:
             return train_dataset_phase2, 2
         return train_dataset, 1
@@ -1093,6 +1134,7 @@ while True:
         dist.all_reduce(epoch_tensor, op=dist.ReduceOp.MIN)
         epochs_completed_sync = int(epoch_tensor.item())
     current_epoch_sync = min(args.num_epochs, epochs_completed_sync + 1)
+    current_epoch_sync_for_loader = current_epoch_sync
 
     # once in a while: evaluate the val bpb (all ranks participate)
     eval_due = False
@@ -1104,7 +1146,7 @@ while True:
         model.eval()
         orig_model.eval()
         val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        eval_steps = max(1, args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size))
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f} | epoch: {current_epoch_sync}")
@@ -1178,18 +1220,6 @@ while True:
                     })
                 else:
                     print0("[mid_train] Benchmark results empty; skipping early stopping update.")
-            if master_process and not args.dry_run:
-                if best_bench_score is None or last_bench_score > best_bench_score:
-                    best_bench_score = last_bench_score
-                    best_bench_step = step
-                    print0(f"New best benchmark score: {best_bench_score:.4f} at step {best_bench_step:05d}")
-                    save_checkpoint(
-                        checkpoint_dir,
-                        step,
-                        orig_model.state_dict(),
-                        [opt.state_dict() for opt in optimizers],
-                        build_checkpoint_meta(step, val_bpb, bench_score=best_bench_score),
-                    )
         if early_stop_should_stop and args.early_stop_metric == "bench":
             print0(
                 f"Early stopping triggered at step {step:05d} "

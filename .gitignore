@@ -15,3 +15,6 @@ wandb/
 
 # Office temp files
 ~$*.xlsx
+
+# macOS
+.DS_Store
